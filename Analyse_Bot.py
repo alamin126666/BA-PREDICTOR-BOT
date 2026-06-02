@@ -173,53 +173,62 @@ def get_cached_history():
             _api_cache = {"numbers": nums, "periods": perids, "ts": time.time()}
     return _api_cache["numbers"], _api_cache["periods"]
 
-def get_loop_period():
-    """Loop period change detection এর জন্য (UTC minute based)"""
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y%m%d%H%M")
-
-def get_display_period():
-    """Signal message এ দেখানোর জন্য period (API থেকে অথবা time-based)"""
-    _, periods = get_cached_history()
-    if periods:
-        try:
-            return str(int(periods[0]) + 1)
-        except:
-            pass
-    now = datetime.now(timezone.utc)
-    total = now.hour * 60 + now.minute
-    return now.strftime("%Y%m%d") + "1000" + str(10001 + total)
-
-def fetch_latest_actual_number():
-    """সর্বশেষ actual result নিয়ে আসে"""
+def fetch_latest_period_direct():
+    """
+    Cache bypass — সরাসরি API থেকে latest completed period এবং number নিয়ে আসে।
+    Returns: (period_str, number_int) অথবা (None, None)
+    """
     try:
         r = requests.get(HISTORY_API, timeout=8)
         if r.status_code == 200:
             data = r.json()
             if data and 'data' in data and 'list' in data['data']:
                 item = data['data']['list'][0]
+                p = str(item.get('issueNumber', ''))
                 n = int(item.get('number', -1))
-                if 0 <= n <= 9:
-                    return n
+                if p and 0 <= n <= 9:
+                    print(f"📡 Latest API period: {p} → {n}")
+                    return p, n
     except Exception as e:
-        print(f"❌ Actual result fetch: {e}")
-    # Fallback to CURRENT_API
+        print(f"❌ Direct period fetch: {e}")
+    return None, None
+
+
+def fetch_result_for_period(target_period):
+    """
+    নির্দিষ্ট period এর actual result খোঁজে।
+    Returns: number (int) অথবা None
+    """
+    target = str(target_period)
     try:
-        payload = {
-            "typeId": 1, "language": 0,
-            "random": "e7fe6c090da2495ab8290dac551ef1ed",
-            "signature": "1F390E2B2D8A55D693E57FD905AE73A7",
-            "timestamp": int(time.time())
-        }
-        r = requests.post(CURRENT_API, json=payload, timeout=8)
+        r = requests.get(HISTORY_API, timeout=8)
         if r.status_code == 200:
             data = r.json()
-            if data and 'data' in data:
-                result = data['data'].get('result')
-                if result is not None:
-                    return int(result)
-    except:
-        pass
+            if data and 'data' in data and 'list' in data['data']:
+                for item in data['data']['list']:
+                    p = str(item.get('issueNumber', ''))
+                    # Full match অথবা suffix match (last digits)
+                    if p == target or (len(target) <= 5 and p.endswith(target)):
+                        n = int(item.get('number', -1))
+                        if 0 <= n <= 9:
+                            print(f"✅ Found result for period {target}: {n}")
+                            return n
+    except Exception as e:
+        print(f"❌ Period result fetch error: {e}")
+    return None
+
+
+def fetch_result_for_period_with_retry(target_period, max_retries=4, delay=3):
+    """
+    Retry সহ নির্দিষ্ট period এর result খোঁজে।
+    API update হতে কয়েক সেকেন্ড লাগে তাই retry দরকার।
+    """
+    for attempt in range(max_retries):
+        result = fetch_result_for_period(target_period)
+        if result is not None:
+            return result
+        print(f"⏳ Period {target_period} not found yet, retry {attempt + 1}/{max_retries}...")
+        time.sleep(delay)
     return None
 
 # ============================================================
@@ -403,18 +412,34 @@ def build_signal_message(channel, user_id=None):
 # ============================================================
 #  RESULT  CHECKING  (WIN / JACKPOT / LOSS)
 # ============================================================
-def check_result(prediction, big_num, small_num):
+def check_result(prediction, big_num, small_num, period=None):
     """
-    actual number এনে WIN / JACKPOT / LOSS নির্ধারণ করে।
+    নির্দিষ্ট period এর actual number এনে WIN / JACKPOT / LOSS নির্ধারণ করে।
+
     JACKPOT = exact number match (big_num বা small_num মিলেছে)
     WIN     = শুধু BIG/SMALL direction মিলেছে
     LOSS    = কিছুই মিলেনি
+
+    period দিলে সেই specific period এর result খোঁজে।
+    না দিলে latest result নেয় (কম accurate)।
     """
-    actual_num = fetch_latest_actual_number()
+    actual_num = None
+
+    if period:
+        # ✅ নির্দিষ্ট period এর result খোঁজো (retry সহ)
+        actual_num = fetch_result_for_period_with_retry(period, max_retries=4, delay=3)
+
     if actual_num is None:
+        # Fallback: latest result
+        p, n = fetch_latest_period_direct()
+        actual_num = n
+
+    if actual_num is None:
+        print("⚠️ Could not get actual result, using random fallback")
         actual_num = random.randint(0, 9)
 
     actual_dir = "BIG" if actual_num >= 5 else "SMALL"
+    print(f"🎯 Period {period}: actual={actual_num} ({actual_dir}), predicted={prediction}, nums={big_num}/{small_num}")
 
     if actual_num == big_num or actual_num == small_num:
         return actual_num, actual_dir, "JACKPOT"
@@ -482,35 +507,33 @@ def send_season_off_sticker(channel):
     _send_sticker_safe(channel, channel_season_off_stickers.get(channel, DEFAULT_SEASON_OFF_STICKER))
 
 # ============================================================
-#  MAIN  PREDICTION  LOOP
+#  MAIN  PREDICTION  LOOP  (API period-based — accurate!)
 # ============================================================
-def _process_pending_result(channel):
-    """
-    Session এর শেষ signal এর result check করে emoji update করে।
-    Returns result_type or None
-    """
-    sess = channel_session.get(channel, [])
-    if not sess or sess[-1].get('emoji', '') != '':
-        return None
-
-    last = sess[-1]
-    actual_num, actual_dir, result_type = check_result(
-        last['pred'], last['big_n'], last['small_n']
-    )
-    emoji = get_result_emoji(result_type)
-    sess[-1]['emoji'] = emoji
-
-    update_session_stats(channel, result_type)
-    add_to_pkl(channel, last['period'], last['pred'],
-               last['big_n'], last['small_n'], actual_num, result_type)
-
-    send_result_sticker(channel, result_type)
-    time.sleep(0.8)
-    return result_type
+def _determine_result(pred, big_n, small_n, actual_num):
+    """WIN / JACKPOT / LOSS নির্ধারণ করে"""
+    actual_dir = "BIG" if actual_num >= 5 else "SMALL"
+    if actual_num == big_n or actual_num == small_n:
+        return actual_num, actual_dir, "JACKPOT"
+    elif actual_dir == pred:
+        return actual_num, actual_dir, "WIN"
+    else:
+        return actual_num, actual_dir, "LOSS"
 
 
 def real_time_auto_prediction(user_id, channel, is_timed=False, duration_minutes=20):
-    """মূল prediction loop — প্রতি মিনিটে একটি signal পাঠায়"""
+    """
+    মূল prediction loop।
+
+    ✅ FIX: UTC time এর বদলে ACTUAL API period number track করে।
+    এতে period mismatch এবং wrong result সমস্যা দূর হবে।
+
+    Flow:
+      1. API থেকে latest completed period নাও
+      2. Next period এর জন্য signal পাঠাও
+      3. API যখন আমাদের predicted period complete করে দেখায়
+         তখন সেই specific period এর result check করো
+      4. Sticker পাঠাও → নতুন signal পাঠাও → repeat
+    """
     if not is_owner(user_id):
         return
 
@@ -518,89 +541,190 @@ def real_time_auto_prediction(user_id, channel, is_timed=False, duration_minutes
         prediction_timers[user_id] = datetime.now() + timedelta(minutes=duration_minutes)
         bot.send_message(user_id, f"⏰ টাইমার সেট: {duration_minutes} মিনিট")
 
-    # Session initialise
     channel_session[channel] = []
     init_session_stats(channel)
 
-    last_period = None
+    # API period tracking (UTC time নয়!)
+    last_signal_period = None   # আমরা যে period এর জন্য signal পাঠিয়েছি
 
     while signal_status.get(user_id, {}).get(channel, False) or channel in pending_season_off:
         try:
             # ── TIMER CHECK ──────────────────────────────────
             if is_timed and user_id in prediction_timers:
                 if datetime.now() >= prediction_timers[user_id]:
-                    if user_id in signal_status:
-                        signal_status[user_id][channel] = False
+                    signal_status.get(user_id, {}).__setitem__(channel, False)
                     pending_season_off[channel] = True
                     del prediction_timers[user_id]
                     bot.send_message(user_id, "⏰ সেশনের সময় শেষ!")
 
-            current_period = get_loop_period()
+            # ── FRESH API FETCH (cache bypass) ───────────────
+            api_latest_period, api_latest_num = fetch_latest_period_direct()
 
-            if current_period != last_period:
+            if api_latest_period is None:
+                time.sleep(3)
+                continue
 
-                # ── SEASON OFF FLOW ───────────────────────────
-                if channel in pending_season_off and \
-                        not signal_status.get(user_id, {}).get(channel, False):
+            # ─────────────────────────────────────────────────
+            # SEASON OFF FLOW
+            # ─────────────────────────────────────────────────
+            if channel in pending_season_off and \
+                    not signal_status.get(user_id, {}).get(channel, False):
 
-                    _process_pending_result(channel)
-
-                    time.sleep(1)
-                    send_season_off_sticker(channel)
-                    time.sleep(1)
-
-                    # Stats message পাঠাও
+                sess = channel_session.get(channel, [])
+                if sess and sess[-1].get('emoji', '') == '' and last_signal_period:
+                    # Last signal এর result check করো
                     try:
-                        bot.send_message(channel, format_stats_message(channel))
+                        predicted_p = last_signal_period
+                        api_p_int   = int(api_latest_period)
+                        pred_p_int  = int(predicted_p)
+
+                        if api_p_int >= pred_p_int:
+                            # Our period is now complete
+                            actual_num = fetch_result_for_period(predicted_p)
+                            if actual_num is None:
+                                actual_num = api_latest_num  # fallback
+                            if actual_num is None:
+                                actual_num = random.randint(0, 9)
+
+                            last = sess[-1]
+                            an, ad, rt = _determine_result(
+                                last['pred'], last['big_n'], last['small_n'], actual_num
+                            )
+                            sess[-1]['emoji'] = get_result_emoji(rt)
+                            update_session_stats(channel, rt)
+                            add_to_pkl(channel, last['period'], last['pred'],
+                                       last['big_n'], last['small_n'], an, rt)
+                            send_result_sticker(channel, rt)
+                            time.sleep(1)
+                        else:
+                            # Period এখনও শেষ হয়নি, অপেক্ষা করো
+                            time.sleep(3)
+                            continue
                     except Exception as e:
-                        print(f"❌ Stats send error: {e}")
+                        print(f"❌ Season off result check: {e}")
 
-                    del pending_season_off[channel]
-                    channel_session[channel] = []
-                    break
+                # Season Off স্টিকার পাঠাও
+                send_season_off_sticker(channel)
+                time.sleep(1)
 
-                # ── ACTIVE SIGNAL FLOW ────────────────────────
-                if signal_status.get(user_id, {}).get(channel, False):
+                # Stats message পাঠাও
+                try:
+                    bot.send_message(channel, format_stats_message(channel))
+                except Exception as e:
+                    print(f"❌ Stats send error: {e}")
 
-                    # আগের signal এর result check
-                    _process_pending_result(channel)
+                pending_season_off.pop(channel, None)
+                channel_session[channel] = []
+                break
 
-                    # নতুন prediction generate করো
-                    prediction, big_num, small_num = generate_wingo_prediction(channel)
-                    disp_period = get_display_period()
+            # ─────────────────────────────────────────────────
+            # ACTIVE SIGNAL FLOW
+            # ─────────────────────────────────────────────────
+            if not signal_status.get(user_id, {}).get(channel, False):
+                time.sleep(2)
+                continue
 
-                    channel_session[channel].append({
-                        'period': disp_period,
-                        'pred':   prediction,
-                        'big_n':  big_num,
-                        'small_n': small_num,
-                        'emoji':  ''
-                    })
-                    update_session_stats(channel, "SIGNAL")
+            if last_signal_period is None:
+                # ── প্রথম Signal ──────────────────────────────
+                # Latest completed period + 1 = currently active period
+                next_period = str(int(api_latest_period) + 1)
+                prediction, big_num, small_num = generate_wingo_prediction(channel)
 
-                    # Signal message পাঠাও (নতুন message, edit নয়)
-                    msg = build_signal_message(channel, user_id)
-                    try:
-                        bot.send_message(channel, msg)
-                        print(f"✅ Signal sent to {channel}: {prediction} {big_num}/{small_num}")
-                    except Exception as e:
-                        print(f"❌ Message send error: {e}")
-                        bot.send_message(user_id, f"⚠️ {channel} এ পাঠাতে সমস্যা: {e}")
+                channel_session[channel].append({
+                    'period':  next_period,
+                    'pred':    prediction,
+                    'big_n':   big_num,
+                    'small_n': small_num,
+                    'emoji':   ''
+                })
+                update_session_stats(channel, "SIGNAL")
 
-                    last_period = current_period
-                else:
-                    last_period = current_period
+                msg = build_signal_message(channel, user_id)
+                try:
+                    bot.send_message(channel, msg)
+                    print(f"📤 1st signal → period {next_period}: {prediction} {big_num}/{small_num}")
+                except Exception as e:
+                    print(f"❌ Send error: {e}")
+                    bot.send_message(user_id, f"⚠️ {channel} এ পাঠাতে সমস্যা: {e}")
 
-            time.sleep(1)
+                last_signal_period = next_period
+
+            else:
+                # ── পরবর্তী Signal: predicted period complete হলে ──
+                try:
+                    api_p_int  = int(api_latest_period)
+                    pred_p_int = int(last_signal_period)
+                except ValueError:
+                    time.sleep(2)
+                    continue
+
+                if api_p_int >= pred_p_int:
+                    # ✅ আমাদের predicted period এখন completed!
+
+                    # ── Result check করো ─────────────────────
+                    sess = channel_session.get(channel, [])
+                    if sess and sess[-1].get('emoji', '') == '':
+                        last = sess[-1]
+                        predicted_p = last['period']
+
+                        # Specific period এর result খোঁজো
+                        actual_num = fetch_result_for_period(predicted_p)
+                        if actual_num is None:
+                            # api_latest_period == predicted_p হলে api_latest_num use করো
+                            if api_p_int == pred_p_int:
+                                actual_num = api_latest_num
+                            else:
+                                # একটু আগের period, history তে খোঁজো
+                                actual_num = fetch_result_for_period_with_retry(predicted_p, max_retries=2, delay=2)
+                        if actual_num is None:
+                            actual_num = random.randint(0, 9)
+
+                        an, ad, rt = _determine_result(
+                            last['pred'], last['big_n'], last['small_n'], actual_num
+                        )
+                        sess[-1]['emoji'] = get_result_emoji(rt)
+                        update_session_stats(channel, rt)
+                        add_to_pkl(channel, last['period'], last['pred'],
+                                   last['big_n'], last['small_n'], an, rt)
+
+                        # Sticker পাঠাও
+                        send_result_sticker(channel, rt)
+                        time.sleep(1)
+
+                    # ── নতুন Signal পাঠাও ────────────────────
+                    if signal_status.get(user_id, {}).get(channel, False):
+                        next_period = str(api_p_int + 1)
+                        prediction, big_num, small_num = generate_wingo_prediction(channel)
+
+                        channel_session[channel].append({
+                            'period':  next_period,
+                            'pred':    prediction,
+                            'big_n':   big_num,
+                            'small_n': small_num,
+                            'emoji':   ''
+                        })
+                        update_session_stats(channel, "SIGNAL")
+
+                        msg = build_signal_message(channel, user_id)
+                        try:
+                            bot.send_message(channel, msg)
+                            print(f"📤 New signal → period {next_period}: {prediction} {big_num}/{small_num}")
+                        except Exception as e:
+                            print(f"❌ Send error: {e}")
+                            bot.send_message(user_id, f"⚠️ {channel}: {e}")
+
+                        last_signal_period = next_period
+                # else: period এখনও শেষ হয়নি, 3 সেকেন্ড পরে check করো
+
+            time.sleep(3)  # 3 সেকেন্ড পর পর API check
 
         except Exception as e:
             print(f"❌ Prediction loop error: {e}")
             time.sleep(5)
 
     # Thread cleanup
-    thread_key = f"{user_id}_{channel}"
-    if thread_key in signal_threads:
-        del signal_threads[thread_key]
+    signal_threads.pop(f"{user_id}_{channel}", None)
+    print(f"🔴 Thread stopped for {channel}")
 
 # ============================================================
 #  CHANNEL  MANAGEMENT
